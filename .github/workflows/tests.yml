@@ -1,0 +1,35 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Model tests
+        run: node --test tests/model.test.js
+
+      - name: Scripts parse
+        run: |
+          bash -n bin/herdr-ctl
+          bash -n install.sh
+          for f in tests/*.sh tests/stubs/*; do bash -n "$f"; done
+
+      - name: Helper script is executable
+        run: test -x bin/herdr-ctl
+
+      - name: Manifest is valid JSON
+        run: node -e "JSON.parse(require('fs').readFileSync('manifest.json', 'utf8'))"
+
+      - name: Helper against stubbed herdr, ssh, hyprctl and ps
+        run: ./tests/ctl.test.sh

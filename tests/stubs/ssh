@@ -1,0 +1,38 @@
+#!/bin/bash
+printf 'ssh %s\n' "$*" >>"${STUB_LOG:-/dev/null}"
+
+script=$(cat)
+remote_args=""
+for arg in "$@"; do remote_args=$arg; done
+
+case "${STUB_SSH_MODE:-ok}" in
+  exec)
+    exec bash -c "$remote_args" <<<"$script" ;;
+  hang)
+    exec sleep 30 ;;
+  nobash)   printf 'bash: command not found\n' >&2; exit 127 ;;
+  auth)     printf 'Permission denied (publickey).\n' >&2; exit 255 ;;
+  hostkey)  printf 'Host key verification failed.\n' >&2; exit 255 ;;
+  refused)  printf 'ssh: connect to host h port 22: Connection refused\n' >&2; exit 255 ;;
+  timeout)  exit 124 ;;
+esac
+
+case "$script" in
+  *"command -v"*)
+    if [ "${STUB_SSH_MODE:-ok}" = noherdr ]; then printf 'P\n'; else printf 'P/opt/herdr/bin/herdr\n'; fi
+    exit 0 ;;
+esac
+
+set -- $remote_args
+shift 4 2>/dev/null || true
+
+printf 'V%s\n' "herdr 9.9.9"
+if [ "$#" -eq 0 ]; then
+  if [ "${STUB_SSH_MODE:-ok}" = badjson ]; then printf 'Lnot json at all\n'; exit 0; fi
+  printf 'L%s\n' '{"sessions":[{"default":true,"name":"default","running":true,"session_dir":"/h","socket_path":"/h/s.sock"}]}'
+  exit 0
+fi
+for n in "$@"; do
+  [ "$n" = "-" ] && n=default
+  printf 'S%s\t%s\n' "$n" '{"id":"cli:api:snapshot","result":{"snapshot":{"version":"9.9.9","agents":[{"agent":"claude","agent_status":"done","pane_id":"w1:p1","state_change_seq":21,"terminal_title_stripped":"far away work","workspace_id":"w1"}],"workspaces":[{"workspace_id":"w1","label":"Repos"}]},"type":"session_snapshot"}}'
+done

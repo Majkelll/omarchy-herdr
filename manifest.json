@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.majkelll.herdr",
+  "name": "Herdr",
+  "version": "1.0.0",
+  "author": "Majkelll",
+  "license": "MIT",
+  "description": "Everything you need for herdr in the bar, and nothing you don't: every server on this machine and over SSH, every agent in herdr's own colours, a badge for the one waiting on you, and one click to its session. Read-only towards herdr, no elevated privileges.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Herdr",
+    "description": "herdr servers and agents on this machine and over SSH, in herdr's own colours, one click from their session.",
+    "category": "Apps",
+    "aliases": [
+      "herdr",
+      "agents",
+      "sessions",
+      "tmux"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshSec": 15,
+      "openRefreshSec": 4
+    },
+    "schema": [
+      {
+        "key": "refreshSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 3,
+        "max": 300,
+        "step": 1,
+        "defaultValue": 15,
+        "description": "How often every machine is asked what it is holding while the panel is closed. Each poll is one ssh round trip per remote machine, on a connection that is kept open between polls. An idle herd is asked half as often, because nothing in it can change until you change it."
+      },
+      {
+        "key": "openRefreshSec",
+        "type": "integer",
+        "label": "Refresh interval while open (seconds)",
+        "min": 2,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 4,
+        "description": "How often the same question is asked while the panel is on screen, where an agent that starts waiting on you should show up quickly."
+      }
+    ]
+  }
+}

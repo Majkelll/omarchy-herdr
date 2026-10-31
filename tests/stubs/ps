@@ -1,0 +1,19 @@
+#!/bin/bash
+if [ "${STUB_PS_MODE:-ok}" = noisy ]; then
+  cat <<'TABLE'
+ 1000   900 kitty
+ 1001  1000 grep -r herdr .
+ 1002  1000 nvim /home/u/herdr
+ 1500     1 /usr/bin/herdr server
+TABLE
+  exit 0
+fi
+cat <<'TABLE'
+ 1000   900 kitty
+ 1001  1000 herdr
+ 1500     1 /usr/bin/herdr server
+ 2000   900 foot --app-id=org.omarchy.herdr -e ssh -t -- dev@192.0.2.10 /opt/herdr/bin/herdr
+ 2001  2000 ssh -t -o BatchMode=yes -o ControlPersist=60 -- dev@192.0.2.10 /opt/herdr/bin/herdr
+ 3000   900 foot -e ssh -t -- other@elsewhere herdr
+ 3001  3000 ssh -t -- other@elsewhere herdr
+TABLE

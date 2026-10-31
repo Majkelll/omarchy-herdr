@@ -1,0 +1,17 @@
+#!/bin/bash
+printf 'hyprctl %s\n' "$*" >>"${STUB_LOG:-/dev/null}"
+case "$1" in
+  clients)
+    if [ "${STUB_HYPR_MODE:-ok}" = named ]; then
+      echo '[{"address":"0xaaa","pid":1000,"class":"kitty","title":"t","workspace":{"id":4,"name":"it'"'"'s work"}}]'
+      exit 0
+    fi
+    cat <<'JSON'
+[{"address":"0xaaa","pid":1000,"class":"kitty","title":"majkel: Repos","workspace":{"id":4,"name":"4"}},
+ {"address":"0xbbb","pid":2000,"class":"org.omarchy.herdr","title":"lab","workspace":{"id":7,"name":"7"}},
+ {"address":"0xccc","pid":3000,"class":"foot","title":"elsewhere","workspace":{"id":9,"name":"9"}}]
+JSON
+    ;;
+  dispatch) echo ok ;;
+  *) exit 0 ;;
+esac

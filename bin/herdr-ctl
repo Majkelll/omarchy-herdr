@@ -1,0 +1,879 @@
+#!/bin/bash
+
+set -uo pipefail
+umask 077
+
+readonly APP_ID=org.omarchy.herdr
+readonly CONFIG_PATH="${HERDR_WIDGET_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-herdr/machines.json}"
+readonly CACHE_DIR="${HERDR_WIDGET_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-herdr}"
+readonly HERDR_BIN="${HERDR_WIDGET_HERDR:-herdr}"
+readonly DRY_RUN="${HERDR_WIDGET_DRY_RUN:-}"
+
+readonly LOCAL_ID=local
+readonly LOCAL_LABEL="This machine"
+
+err_file=/dev/null
+
+readonly CONFIG_BYTE_CAP=$((1 * 1024 * 1024))
+readonly SESSIONS_BYTE_CAP=$((2 * 1024 * 1024))
+readonly SNAPSHOT_BYTE_CAP=$((2 * 1024 * 1024))
+readonly SNAPSHOTS_BYTE_CAP=8000000
+readonly WINDOWS_BYTE_CAP=$((4 * 1024 * 1024))
+readonly PS_BYTE_CAP=$((4 * 1024 * 1024))
+readonly MACHINE_CAP=32
+readonly SESSION_CAP=64
+readonly AGENT_CAP=200
+
+readonly DEFAULT_TIMEOUT=6
+readonly MIN_TIMEOUT=2
+readonly MAX_TIMEOUT=60
+
+readonly LOCAL_TIMEOUT=5
+
+die() {
+  printf '%s\n' "${1:-error}" >&2
+  exit 1
+}
+
+bounded() {
+  timeout -k 1 "$LOCAL_TIMEOUT" "$@"
+}
+
+snapshot_error() {
+  printf '{"ok":false,"error":%s,"machines":[]}\n' "$(json_string "${1:-}")"
+  exit 0
+}
+
+json_string() {
+  printf '%s' "${1-}" | jq -Rs .
+}
+
+over_cap() {
+  [ "$(printf '%s' "${1-}" | wc -c)" -gt "$2" ]
+}
+
+require_tools() {
+  local tool
+  for tool in jq ps timeout; do
+    command -v "$tool" >/dev/null 2>&1 && continue
+    if [[ ${1-} == snapshot ]]; then
+      printf '{"ok":false,"error":"missing-%s","machines":[]}\n' "$tool"
+      exit 0
+    fi
+    die "missing-$tool"
+  done
+}
+
+valid_session_name() { [[ "${1-}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; }
+valid_pane_id()      { [[ "${1-}" =~ ^[A-Za-z0-9_-]{1,32}:[A-Za-z0-9_-]{1,32}$ ]]; }
+valid_machine_id()   { [[ "${1-}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]]; }
+valid_host()         { [[ "${1-}" =~ ^[A-Za-z0-9][A-Za-z0-9._@:-]{0,254}$ ]]; }
+valid_user()         { [[ -z "${1-}" || "${1-}" =~ ^[A-Za-z0-9._][A-Za-z0-9._-]{0,63}$ ]]; }
+valid_port()         { [[ -z "${1-}" || ( "${1-}" =~ ^[0-9]{1,5}$ && 10#$1 -ge 1 && 10#$1 -le 65535 ) ]]; }
+valid_path()         { [[ -z "${1-}" || "${1-}" =~ ^(/[A-Za-z0-9._/-]{1,255}|[A-Za-z0-9._][A-Za-z0-9._-]{0,63})$ ]]; }
+valid_identity()     { [[ -z "${1-}" || "${1-}" =~ ^[A-Za-z0-9._~/][A-Za-z0-9._~/-]{0,254}$ ]]; }
+
+clamp_timeout() {
+  local value="${1-}"
+  [[ $value =~ ^[0-9]{1,6}$ ]] || { printf '%s' "$DEFAULT_TIMEOUT"; return; }
+  value=$((10#$value))
+  (( value < MIN_TIMEOUT )) && value=$MIN_TIMEOUT
+  (( value > MAX_TIMEOUT )) && value=$MAX_TIMEOUT
+  printf '%s' "$value"
+}
+
+readable_file() { [[ -f "$1" && ! -L "$1" ]]; }
+
+private_dir() {
+  local dir="$1" owner
+  mkdir -p -m 700 -- "$dir" 2>/dev/null
+  [[ -d $dir && ! -L $dir ]] || return 1
+  owner="$(stat -c '%u' -- "$dir" 2>/dev/null)" || return 1
+  [[ $owner == "$(id -u)" ]] || return 1
+  return 0
+}
+
+config_rows() {
+  local raw=""
+  if readable_file "$CONFIG_PATH"; then
+    raw=$(head -c "$((CONFIG_BYTE_CAP + 1))" -- "$CONFIG_PATH" 2>/dev/null) || raw=""
+  fi
+  [[ -n $raw ]] || return 0
+  over_cap "$raw" "$CONFIG_BYTE_CAP" && { printf 'ERROR\n'; return 0; }
+  printf '%s' "$raw" | jq -e '
+    type == "object" and ((.machines // []) | type == "array")' >/dev/null 2>&1 ||
+    { printf 'ERROR\n'; return 0; }
+
+  printf '%s' "$raw" | jq -r --argjson cap "$MACHINE_CAP" '
+    def text: if . == null then "" elif type == "string" then . else tostring end;
+    [ (.machines // [])[] | select(type == "object") ]
+    | reduce .[] as $m ([];
+        if any(.[]; (.id | text) == ($m.id | text)) then . else . + [$m] end)
+    | .[:$cap][]
+    | [ (.id | text),
+        (.label | text),
+        (.host | text),
+        (.port | text),
+        (.user | text),
+        (.identityFile | text),
+        (.connectTimeoutSec | text),
+        (.herdrPath | text),
+        (if .enabled == false then "0" else "1" end) ]
+    | map(gsub("[\u0000-\u001f\u007f]"; "") | sub("^\\s+"; "") | sub("\\s+$"; ""))
+    | join("\u001f")' 2>/dev/null
+}
+
+m_id=""; m_label=""; m_host=""; m_port=""; m_user=""; m_identity=""
+m_timeout=""; m_herdr=""; m_enabled=""
+
+m_bad=""
+load_machine_row() {
+  m_bad=""
+  IFS=$'\x1f' read -r m_id m_label m_host m_port m_user m_identity m_timeout m_herdr m_enabled <<<"$1"
+  [[ $m_port =~ ^0+$ ]] && m_port=""
+  [[ $m_port =~ ^[0-9]{1,5}$ ]] && m_port=$((10#$m_port))
+  m_timeout=$(clamp_timeout "$m_timeout")
+  [[ -n $m_label ]] || m_label=$m_host
+  valid_machine_id "$m_id" || return 1
+  [[ $m_id != "$LOCAL_ID" ]] || return 1
+  [[ -n $m_label ]] || m_label=$m_id
+  if ! valid_host "$m_host"; then m_bad=bad-host
+  elif ! valid_user "$m_user"; then m_bad=bad-user
+  elif ! valid_port "$m_port"; then m_bad=bad-port
+  elif ! valid_path "$m_herdr"; then m_bad=bad-path
+  elif ! valid_identity "$m_identity"; then m_bad=bad-identity
+  fi
+  [[ -z $m_bad ]] || return 2
+  return 0
+}
+
+machine_target() {
+  [[ -z $m_user ]] && { printf '%s' "$m_host"; return; }
+  printf '%s@%s' "$m_user" "$m_host"
+}
+
+ssh_args() {
+  local socket="$CACHE_DIR/cm-%C"
+  [[ ${1-} == interactive ]] || printf '%s\n' -o BatchMode=yes
+  printf '%s\n' \
+    -o "ConnectTimeout=$m_timeout" \
+    -o ControlMaster=auto \
+    -o "ControlPath=$socket" \
+    -o ControlPersist=60
+  [[ -n $m_port ]] && printf '%s\n%s\n' -p "$m_port"
+  [[ -n $m_identity ]] && printf '%s\n%s\n%s\n%s\n' -o IdentitiesOnly=yes -i "$m_identity"
+  return 0
+}
+
+ssh_error_code() {
+  local status="$1" text="$2"
+  case "$status" in
+    124|137) printf 'timeout'; return ;;
+    99) printf 'too-large'; return ;;
+  esac
+  case "$text" in
+    *"bash: command not found"*|*"bash: not found"*|*"bash: No such file"*)
+      printf 'no-bash' ;;
+    *"Permission denied"*|*"Too many authentication failures"*|*"no matching host key"*)
+      printf 'auth-failed' ;;
+    *"Host key verification failed"*|*"REMOTE HOST IDENTIFICATION HAS CHANGED"*|*"Host key for"*)
+      printf 'host-key' ;;
+    *) printf 'unreachable' ;;
+  esac
+}
+
+m_deadline=""
+remote_run() {
+  local script="$1" cap="$2"
+  shift 2
+  local -a args=()
+  mapfile -t args < <(ssh_args)
+  local budget=$((m_timeout * 3))
+  if [[ -n $m_deadline ]]; then
+    budget=$((m_deadline - SECONDS))
+    (( budget > 0 )) || return 124
+  fi
+  local quoted=""
+  (( $# == 0 )) || printf -v quoted ' %q' "$@"
+  local out status
+  out=$(timeout -k 2 "$budget" ssh "${args[@]}" -- "$(machine_target)" \
+    "bash -s --$quoted" <<<"$script" 2>"$err_file")
+  status=$?
+  if (( status != 0 )); then return "$status"; fi
+  if over_cap "$out" "$cap"; then return 99; fi
+  printf '%s' "$out"
+  return 0
+}
+
+readonly REMOTE_INVENTORY='
+set -u
+P="$1"; shift
+one() { tr -d "\r\n"; }
+printf "V%s\n" "$("$P" --version 2>/dev/null | head -1)"
+if [ "$#" -eq 0 ]; then
+  printf "L%s\n" "$("$P" session list --json 2>/dev/null | one | head -c 2200000)"
+  exit 0
+fi
+for n in "$@"; do
+  if [ "$n" = "-" ]; then
+    printf "S%s\t%s\n" "default" "$("$P" api snapshot 2>/dev/null | one)"
+  else
+    printf "S%s\t%s\n" "$n" "$("$P" --session "$n" api snapshot 2>/dev/null | one)"
+  fi
+done | head -c 8000001
+'
+
+readonly REMOTE_LOCATE='
+set -u
+if [ "$#" -gt 0 ] && [ -n "$1" ]; then
+  set -- "$1"
+else
+  set -- herdr "$HOME/.local/bin/herdr" /usr/local/bin/herdr /usr/bin/herdr /opt/homebrew/bin/herdr
+fi
+for c in "$@"; do
+  if p=$(command -v "$c" 2>/dev/null) && [ -x "$p" ]; then printf "P%s\n" "$p"; exit 0; fi
+done
+printf "P\n"
+'
+
+resolve_remote_herdr() {
+  [[ -z $m_herdr ]] || return 0
+  local out status path
+  out=$(remote_run "$REMOTE_LOCATE" 4096 "")
+  status=$?
+  (( status == 0 )) || return "$status"
+  path=$(printf '%s' "$out" | sed -n 's/^P//p' | head -1)
+  [[ -n $path ]] && valid_path "$path" || return 3
+  m_herdr=$path
+  return 0
+}
+
+local_sessions_json() {
+  command -v "$HERDR_BIN" >/dev/null 2>&1 || return 2
+  local out
+  out=$(bounded "$HERDR_BIN" session list --json 2>/dev/null | head -c "$((SESSIONS_BYTE_CAP + 1))") || true
+  [[ -n $out ]] || return 1
+  over_cap "$out" "$SESSIONS_BYTE_CAP" && return 3
+  printf '%s' "$out"
+}
+
+local_snapshot() {
+  local name="$1" is_default="$2" out
+  if [[ $is_default == true ]]; then
+    out=$(bounded "$HERDR_BIN" api snapshot 2>/dev/null | head -c "$((SNAPSHOT_BYTE_CAP + 1))") || true
+  else
+    out=$(bounded "$HERDR_BIN" --session "$name" api snapshot 2>/dev/null | head -c "$((SNAPSHOT_BYTE_CAP + 1))") || true
+  fi
+  [[ -n $out ]] || return 1
+  over_cap "$out" "$SNAPSHOT_BYTE_CAP" && return 1
+  printf '%s' "$out"
+}
+
+strip_version() {
+  printf '%s' "${1-}" | sed -e 's/^herdr[[:space:]]*//' -e 's/[^A-Za-z0-9._+-]//g'
+}
+
+local_version() {
+  strip_version "$(bounded "$HERDR_BIN" --version 2>/dev/null | head -1)"
+}
+
+session_rows() {
+  printf '%s' "$1" | jq -r '
+    (.sessions // []) | if type == "array" then .[] else empty end
+    | select(type == "object")
+    | [(.name // "" | tostring), (.default == true | tostring), (.running == true | tostring)]
+    | join("\u001f")' 2>/dev/null
+}
+
+shape_sessions() {
+  local sessions_json="$1" snapshots="$2"
+  printf '%s' "$sessions_json" | jq -c \
+    --argjson snapshots "$snapshots" \
+    --argjson agentCap "$AGENT_CAP" \
+    --argjson sessionCap "$SESSION_CAP" '
+    def obj: if type == "object" then . else {} end;
+    def arr: if type == "array" then . else [] end;
+    def text: if . == null then "" elif type == "string" then . else tostring end;
+    [ (.sessions // []) | arr | .[] | select(type == "object")
+      | select((.name // "" | text) | test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) ]
+    | .[:$sessionCap]
+    | map(
+        (.name | text) as $name
+        | ($snapshots[$name] | obj | .result | obj | .snapshot | obj) as $snap
+        | ($snap.agents | arr | map(select(type == "object"))) as $agents
+        | ($snap.workspaces | arr | map(select(type == "object"))) as $workspaces
+        | ($workspaces
+           | map({key: (.workspace_id | text), value: (.label | text)})
+           | from_entries) as $wslabels
+        | {
+            name: $name,
+            isDefault: (.default == true),
+            running: (.running == true),
+            version: ($snap.version | text),
+            projects: ($workspaces | map(.label | text)
+                       | map(select(length > 0)) | unique),
+            agents: ($agents
+                     | map({pane: (.pane_id | text),
+                            title: ((.terminal_title_stripped // .terminal_title) | text),
+                            status: ((.agent_status // "idle") | text),
+                            workspace: ($wslabels[.workspace_id | text] // ""),
+                            seq: (.state_change_seq | if type == "number" then . else 0 end)})
+                     | map(select(.title != "" and .pane != ""))
+                     | .[:$agentCap])
+          })' 2>/dev/null
+}
+
+machine_object() {
+  local id="$1" label="$2" remote="$3" target="$4" enabled="$5" reachable="$6" \
+    error="$7" version="$8" sessions="$9"
+  printf '%s' "$sessions" | jq -e 'type == "array"' >/dev/null 2>&1 || sessions='[]'
+  jq -nc \
+    --arg id "$id" --arg label "$label" --arg target "$target" \
+    --arg error "$error" --arg version "$version" \
+    --argjson remote "$remote" --argjson enabled "$enabled" --argjson reachable "$reachable" \
+    --argjson sessions "$sessions" '
+    {id: $id, label: $label, remote: $remote, target: $target, enabled: $enabled,
+     reachable: $reachable, error: $error, version: $version, sessions: $sessions}'
+}
+
+remote_failure() {
+  machine_object "$m_id" "$m_label" true "$(machine_target)" true false "$1" "${2-}" '[]'
+}
+
+gather_local() {
+  local sessions_json snapshots='' name is_default running snap status
+  sessions_json=$(local_sessions_json)
+  status=$?
+  if (( status != 0 )); then
+    local code=no-server
+    (( status == 2 )) && code=herdr-missing
+    (( status == 3 )) && code=too-large
+    machine_object "$LOCAL_ID" "$LOCAL_LABEL" false "" true false "$code" "" '[]'
+    return 0
+  fi
+
+  while IFS=$'\x1f' read -r name is_default running; do
+    valid_session_name "$name" || continue
+    [[ $running == true ]] || continue
+    snap=$(local_snapshot "$name" "$is_default") || continue
+    printf '%s' "$snap" | jq -e . >/dev/null 2>&1 || continue
+    snapshots+="${snapshots:+,}\"$name\":$snap"
+  done < <(session_rows "$sessions_json")
+
+  snapshots="{$snapshots}"
+  printf '%s' "$snapshots" | jq -e . >/dev/null 2>&1 || snapshots='{}'
+
+  local sessions
+  sessions=$(shape_sessions "$sessions_json" "$snapshots")
+  machine_object "$LOCAL_ID" "$LOCAL_LABEL" false "" true true "" "$(local_version)" "${sessions:-[]}"
+}
+
+gather_remote() {
+  local err_file
+  err_file=$(mktemp -p "${TMPDIR:-/tmp}" herdr-ctl-err.XXXXXX) || err_file=/dev/null
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$err_file'" RETURN
+  m_deadline=$((SECONDS + m_timeout * 3))
+
+  local out status sessions_json="" version="" path="$m_herdr" resolved=false
+
+  if [[ -z $path ]]; then
+    resolve_remote_herdr
+    status=$?
+    (( status == 3 )) && { remote_failure herdr-missing; return 0; }
+    (( status == 0 )) || {
+      remote_failure "$(ssh_error_code "$status" "$(cat -- "$err_file" 2>/dev/null)")"
+      return 0
+    }
+    path="$m_herdr"
+    resolved=true
+  fi
+
+  out=$(remote_run "$REMOTE_INVENTORY" "$SESSIONS_BYTE_CAP" "$path")
+  status=$?
+  (( status == 99 )) && { remote_failure too-large; return 0; }
+  if (( status != 0 )) || [[ -z $out ]]; then
+    remote_failure "$(ssh_error_code "$status" "$(cat -- "$err_file" 2>/dev/null)")"
+    return 0
+  fi
+  version=$(strip_version "$(printf '%s' "$out" | sed -n 's/^V//p' | head -1)")
+
+  if [[ -z $version && $resolved == false ]]; then
+    m_herdr=""
+    resolve_remote_herdr
+    status=$?
+    (( status == 3 )) && { remote_failure herdr-missing; return 0; }
+    (( status == 0 )) || {
+      remote_failure "$(ssh_error_code "$status" "$(cat -- "$err_file" 2>/dev/null)")"
+      return 0
+    }
+    path="$m_herdr"
+    out=$(remote_run "$REMOTE_INVENTORY" "$SESSIONS_BYTE_CAP" "$path")
+    status=$?
+    (( status == 99 )) && { remote_failure too-large; return 0; }
+    if (( status != 0 )) || [[ -z $out ]]; then
+      remote_failure "$(ssh_error_code "$status" "$(cat -- "$err_file" 2>/dev/null)")"
+      return 0
+    fi
+    version=$(strip_version "$(printf '%s' "$out" | sed -n 's/^V//p' | head -1)")
+  fi
+
+  sessions_json=$(printf '%s' "$out" | sed -n 's/^L//p' | head -1)
+  printf '%s' "$sessions_json" | jq -e 'type == "object"' >/dev/null 2>&1 || {
+    remote_failure bad-json "$version"
+    return 0
+  }
+
+  local -a names=()
+  local name is_default running
+  while IFS=$'\x1f' read -r name is_default running; do
+    valid_session_name "$name" || continue
+    [[ $running == true ]] || continue
+    (( ${#names[@]} < SESSION_CAP )) || break
+    if [[ $is_default == true ]]; then names+=("-"); else names+=("$name"); fi
+  done < <(session_rows "$sessions_json")
+
+  local snapshots=''
+  if (( ${#names[@]} > 0 )); then
+    out=$(remote_run "$REMOTE_INVENTORY" "$SNAPSHOTS_BYTE_CAP" "$path" "${names[@]}")
+    status=$?
+    if (( status != 0 )); then
+      remote_failure "$(ssh_error_code "$status" "$(cat -- "$err_file" 2>/dev/null)")" "$version"
+      return 0
+    fi
+    local line snap_name snap_json default_name
+    default_name=$(printf '%s' "$sessions_json" |
+      jq -r 'first((.sessions // [])[] | objects | select(.default == true) | .name // "" | tostring) // ""' \
+      2>/dev/null)
+    while IFS= read -r line; do
+      [[ $line == S* ]] || continue
+      line=${line#S}
+      snap_name=${line%%$'\t'*}
+      snap_json=${line#*$'\t'}
+      [[ $snap_name == default && -n $default_name ]] && snap_name=$default_name
+      valid_session_name "$snap_name" || continue
+      printf '%s' "$snap_json" | jq -e . >/dev/null 2>&1 || continue
+      snapshots+="${snapshots:+,}\"$snap_name\":$snap_json"
+    done <<<"$out"
+  fi
+  snapshots="{$snapshots}"
+  printf '%s' "$snapshots" | jq -e . >/dev/null 2>&1 || snapshots='{}'
+
+  local sessions
+  sessions=$(shape_sessions "$sessions_json" "$snapshots")
+  machine_object "$m_id" "$m_label" true "$(machine_target)" true true "" "$version" "${sessions:-[]}"
+}
+
+window_map() {
+  local targets="$1"
+
+  command -v hyprctl >/dev/null 2>&1 || return 0
+
+  local clients
+  clients=$(bounded hyprctl clients -j 2>/dev/null | head -c "$((WINDOWS_BYTE_CAP + 1))") || true
+  [[ -n $clients ]] || return 0
+  over_cap "$clients" "$WINDOWS_BYTE_CAP" && return 0
+
+  local processes
+  processes=$(bounded ps -eo pid=,ppid=,args= 2>/dev/null | head -c "$((PS_BYTE_CAP + 1))") || true
+  [[ -n $processes ]] || return 0
+  over_cap "$processes" "$PS_BYTE_CAP" && return 0
+
+  local windows
+  windows=$(printf '%s' "$clients" |
+    jq -r '.[]? | objects | select((.pid // 0) > 0)
+      | [(.pid | tostring), (.address // "" | tostring), (.workspace.name? // "" | tostring)]
+      | map(gsub("[\t\n\r]"; " ")) | join("\t")' \
+    2>/dev/null) || return 0
+
+  awk -F'\t' -v targets="$targets" '
+    BEGIN {
+      n = split(targets, rows, "\n")
+      for (i = 1; i <= n; i++) {
+        if (rows[i] == "") continue
+        split(rows[i], parts, "\x1f")
+        machine_of[parts[2]] = parts[1]
+        if (parts[3] != "") machine_of[parts[3]] = parts[1]
+        if (parts[4] != "") machine_of[parts[4]] = parts[1]
+      }
+    }
+    NR == FNR {
+      window_of[$1] = $2 "\t" $3
+      next
+    }
+    {
+      line = $0
+      sub(/^[ ]*/, "", line)
+      split(line, f, " ")
+      pid = f[1]; ppid = f[2]
+      parent[pid] = ppid
+      args[pid] = line
+    }
+    END {
+      for (pid in args) {
+        session = classify(args[pid])
+        if (session == "") continue
+        split(session, sp, "\x1f")
+        machine = sp[1]; name = sp[2]
+        cur = pid
+        hops = 0
+        while (cur != "" && cur != "0" && cur != "1" && hops < 12) {
+          if (cur in window_of) {
+            key = machine "\t" name
+            if (!(key in seen)) {
+              seen[key] = 1
+              print key "\t" window_of[cur]
+            }
+            break
+          }
+          cur = parent[cur]
+          hops++
+        }
+      }
+    }
+    function classify(cmd,   words, count, i, j, base, name, machine, start) {
+      count = split(cmd, words, " ")
+      machine = "local"
+      name = "default"
+      base = words[3]
+      sub(/^.*\//, "", base)
+      if (base == "herdr") {
+        start = 3
+      } else if (base == "ssh") {
+        start = 0
+        for (i = 4; i <= count; i++) {
+          if (words[i] in machine_of) { machine = machine_of[words[i]]; start = i; break }
+        }
+        if (start == 0) return ""
+        start++
+        base = words[start]
+        sub(/^.*\//, "", base)
+        if (base != "herdr") return ""
+      } else {
+        return ""
+      }
+      if (words[start + 1] == "server") return ""
+      for (j = start + 1; j <= count; j++) {
+        if (words[j] == "--session") { name = words[j + 1]; break }
+      }
+      if (name !~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/) return ""
+      return machine "\x1f" name
+    }
+  ' <(printf '%s\n' "$windows") <(printf '%s\n' "$processes") 2>/dev/null
+}
+
+window_targets() {
+  local row
+  while IFS= read -r row; do
+    [[ -n $row ]] || continue
+    [[ $row == ERROR ]] && continue
+    load_machine_row "$row" || continue
+    [[ $m_enabled == 1 ]] || continue
+    printf '%s\x1f%s\x1f%s\x1f%s\n' "$m_id" "$m_host" "$(machine_target)" \
+      "ssh://$(machine_target)${m_port:+:$m_port}"
+  done < <(config_rows)
+}
+
+cmd_snapshot() {
+  local rows config_error=""
+  rows=$(config_rows)
+  if [[ $rows == ERROR ]]; then
+    config_error="config-unreadable"
+    rows=""
+  fi
+
+  local work
+  work=$(mktemp -d -p "${TMPDIR:-/tmp}" herdr-ctl.XXXXXX) || snapshot_error "no-tmpdir"
+  # shellcheck disable=SC2064
+  trap "rm -rf -- '$work'" EXIT
+
+  gather_local >"$work/00-$LOCAL_ID.json" &
+
+  local row index=0 loaded
+  while IFS= read -r row; do
+    [[ -n $row ]] || continue
+    load_machine_row "$row"
+    loaded=$?
+    (( loaded == 1 )) && continue
+    index=$((index + 1))
+    (( index <= MACHINE_CAP )) || break
+    if (( loaded == 2 )); then
+      machine_object "$m_id" "$m_label" true "" "$([[ $m_enabled == 1 ]] && echo true || echo false)" \
+        false "$m_bad" "" '[]' >"$work/$(printf '%02d' "$index")-$m_id.json"
+      continue
+    fi
+    if [[ $m_enabled != 1 ]]; then
+      machine_object "$m_id" "$m_label" true "$(machine_target)" false false "" "" '[]' \
+        >"$work/$(printf '%02d' "$index")-$m_id.json"
+      continue
+    fi
+    gather_remote >"$work/$(printf '%02d' "$index")-$m_id.json" &
+  done <<<"$rows"
+  wait
+
+  local windows
+  windows=$(window_map "$(window_targets)")
+
+  local machines file
+  machines=$(
+    for file in "$work"/*.json; do
+      [[ -s $file ]] || continue
+      jq -c 'select(type == "object" and (.id // "") != "")' -- "$file" 2>/dev/null
+    done | jq -s -c . 2>/dev/null
+  ) || machines='[]'
+  [[ -n $machines ]] || machines='[]'
+
+  jq -nc \
+    --argjson machines "$machines" \
+    --arg error "$config_error" \
+    --arg windows "$windows" '
+    ($windows | split("\n") | map(select(length > 0) | split("\t"))
+      | map({key: (.[0] + "\u001f" + .[1]), value: {window: .[2], workspace: .[3]}})
+      | from_entries) as $win
+    | {
+        ok: true,
+        error: $error,
+        machines: ($machines
+          | map(. as $m
+                | .sessions = ((.sessions // [])
+                    | map(. + ($win[($m.id + "\u001f" + (.name // ""))] // {window: "", workspace: ""})))))
+      }
+    | . + {totals: {
+        machines: (.machines | length),
+        reachable: ([.machines[] | select(.reachable)] | length),
+        servers: ([.machines[].sessions[] | select(.running)] | length),
+        agents: ([.machines[].sessions[].agents | length] | add // 0),
+        blocked: ([.machines[].sessions[].agents[] | select(.status == "blocked")] | length),
+        done: ([.machines[].sessions[].agents[] | select(.status == "done")] | length),
+        working: ([.machines[].sessions[].agents[] | select(.status == "working")] | length)
+      }}'
+}
+
+cmd_open() {
+  local id="${1-}" session="${2-}" pane="${3-}"
+  valid_machine_id "$id" || die "bad-machine"
+  valid_session_name "$session" || die "bad-session"
+  [[ -z $pane ]] || valid_pane_id "$pane" || die "bad-pane"
+
+  local is_local=false
+  if [[ $id == "$LOCAL_ID" ]]; then
+    is_local=true
+  else
+    local row found=false loaded=0
+    while IFS= read -r row; do
+      [[ -n $row && $row != ERROR ]] || continue
+      load_machine_row "$row"
+      loaded=$?
+      (( loaded == 1 )) && continue
+      [[ $m_id == "$id" ]] || continue
+      found=true
+      break
+    done < <(config_rows)
+    [[ $found == true ]] || die "bad-machine"
+    (( loaded == 0 )) || die "$m_bad"
+    resolve_remote_herdr || true
+  fi
+
+  focus_pane "$is_local" "$session" "$pane"
+
+  local window="" workspace=""
+  IFS=$'\t' read -r window workspace < <(
+    window_map "$(window_targets)" |
+      awk -F'\t' -v m="$id" -v s="$session" '$1 == m && $2 == s { print $3 "\t" $4; exit }')
+
+  if [[ -n $window ]]; then
+    raise_window "$window" "$workspace"
+    printf 'ok\n'
+    return 0
+  fi
+
+  launch_session "$is_local" "$session" || die "no-terminal"
+  printf 'ok\n'
+}
+
+focus_pane() {
+  local is_local="$1" session="$2" pane="$3"
+  [[ -n $pane ]] || return 0
+
+  local -a cmd=()
+  if [[ $is_local == true ]]; then
+    cmd=("$HERDR_BIN")
+    [[ $session == default ]] || cmd+=(--session "$session")
+    cmd+=(agent focus "$pane")
+    if [[ -n $DRY_RUN ]]; then printf 'focus: %s\n' "${cmd[*]}"; return 0; fi
+    bounded "${cmd[@]}" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  local remote="${m_herdr:-herdr}"
+  local -a args=("$remote")
+  [[ $session == default ]] || args+=(--session "$session")
+  args+=(agent focus "$pane")
+  if [[ -n $DRY_RUN ]]; then printf 'focus: ssh %s -- %s\n' "$(machine_target)" "${args[*]}"; return 0; fi
+  local -a ssh_opts=()
+  mapfile -t ssh_opts < <(ssh_args)
+  timeout -k 2 "$((m_timeout * 3))" ssh -n "${ssh_opts[@]}" -- "$(machine_target)" "${args[@]}" \
+    >/dev/null 2>&1 || true
+}
+
+raise_window() {
+  local window="$1" workspace="$2"
+  [[ $window =~ ^0x[0-9a-fA-F]+$ ]] || return 0
+  local lua_workspace=""
+  if [[ -n $workspace && $workspace != *[[:cntrl:]]* && ${#workspace} -le 128 ]]; then
+    lua_workspace=${workspace//\\/\\\\}
+    lua_workspace=${lua_workspace//\'/\\\'}
+  fi
+
+  if [[ -n $DRY_RUN ]]; then
+    printf 'dispatch: workspace=%s window=%s\n' "$workspace" "$window"
+    return 0
+  fi
+  if [[ -n $lua_workspace ]]; then
+    bounded hyprctl dispatch "hl.dsp.focus({ workspace = '$lua_workspace' })" >/dev/null 2>&1
+  fi
+  bounded hyprctl dispatch "hl.dsp.focus({ window = 'address:$window' })" >/dev/null 2>&1
+}
+
+session_command() {
+  local is_local="$1" session="$2"
+  if [[ $is_local == true ]]; then
+    printf '%s\n' "$HERDR_BIN"
+    [[ $session == default ]] || printf '%s\n%s\n' --session "$session"
+    return 0
+  fi
+
+  local -a ssh_opts=()
+  mapfile -t ssh_opts < <(ssh_args interactive)
+  printf '%s\n' ssh -t "${ssh_opts[@]}" -- "$(machine_target)" "${m_herdr:-herdr}"
+  [[ $session == default ]] || printf '%s\n%s\n' --session "$session"
+  return 0
+}
+
+launch_terminal() {
+  local app_id="$1"
+  shift
+  local -a command=("$@")
+  local -a launch=()
+
+  if [[ -n $DRY_RUN ]]; then
+    printf 'launch: app-id=%s cmd=%s\n' "$app_id" "${command[*]}"
+    return 0
+  fi
+
+  if command -v uwsm-app >/dev/null 2>&1; then launch=(setsid uwsm-app --)
+  else launch=(setsid); fi
+
+  if command -v xdg-terminal-exec >/dev/null 2>&1; then
+    launch+=(xdg-terminal-exec "--app-id=$app_id" "--dir=$HOME" -- "${command[@]}")
+  elif command -v foot >/dev/null 2>&1; then
+    launch+=(foot "--app-id=$app_id" "--working-directory=$HOME" -e "${command[@]}")
+  elif command -v kitty >/dev/null 2>&1; then
+    launch+=(kitty --class "$app_id" --directory "$HOME" -e "${command[@]}")
+  elif command -v alacritty >/dev/null 2>&1; then
+    launch+=(alacritty --class "$app_id" --working-directory "$HOME" -e "${command[@]}")
+  elif command -v ghostty >/dev/null 2>&1; then
+    launch+=(ghostty "--class=$app_id" "--working-directory=$HOME" -e "${command[@]}")
+  else
+    return 1
+  fi
+
+  "${launch[@]}" >/dev/null 2>&1 &
+  disown
+  return 0
+}
+
+launch_session() {
+  local is_local="$1" session="$2"
+  local -a command=()
+  mapfile -t command < <(session_command "$is_local" "$session")
+  (( ${#command[@]} > 0 )) || return 1
+  launch_terminal "$APP_ID" "${command[@]}"
+}
+
+cmd_probe() {
+  m_host="${1-}"
+  m_port="${2-}"
+  m_user="${3-}"
+  m_identity="${4-}"
+  m_timeout=$(clamp_timeout "${5-}")
+  m_herdr="${6-}"
+
+  valid_host "$m_host" || die "bad-host"
+  valid_user "$m_user" || die "bad-user"
+  valid_port "$m_port" || die "bad-port"
+  valid_path "$m_herdr" || die "bad-path"
+  valid_identity "$m_identity" || die "bad-identity"
+  private_dir "$CACHE_DIR" || true
+
+  local err_file
+  err_file=$(mktemp -p "${TMPDIR:-/tmp}" herdr-ctl-err.XXXXXX) || err_file=/dev/null
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$err_file'" RETURN
+
+  local out status path=""
+  out=$(remote_run "$REMOTE_LOCATE" 4096 "$m_herdr")
+  status=$?
+  if (( status != 0 )); then
+    probe_result false "" "" false "$(ssh_error_code "$status" "$(cat -- "$err_file" 2>/dev/null)")"
+    return 0
+  fi
+  path=$(printf '%s' "$out" | sed -n 's/^P//p' | head -1)
+  if [[ -z $path ]] || ! valid_path "$path"; then
+    probe_result true "" "" false "herdr-missing"
+    return 0
+  fi
+
+  out=$(remote_run "$REMOTE_INVENTORY" "$SESSIONS_BYTE_CAP" "$path")
+  status=$?
+  if (( status != 0 )); then
+    probe_result true "$path" "" false "$(ssh_error_code "$status" "$(cat -- "$err_file" 2>/dev/null)")"
+    return 0
+  fi
+
+  local version sessions running=false
+  version=$(strip_version "$(printf '%s' "$out" | sed -n 's/^V//p' | head -1)")
+  sessions=$(printf '%s' "$out" | sed -n 's/^L//p' | head -1)
+  if printf '%s' "$sessions" | jq -e '[(.sessions // [])[] | select(.running == true)] | length > 0' \
+    >/dev/null 2>&1; then
+    running=true
+  fi
+  probe_result true "$path" "$version" "$running" ""
+}
+
+probe_result() {
+  jq -nc --argjson reachable "$1" --arg path "$2" --arg version "$3" \
+    --argjson server "$4" --arg error "${5-}" '
+    {reachable: $reachable, herdrPath: $path, version: $version, server: $server, error: $error}'
+}
+
+cmd_install() {
+  m_host="${1-}"
+  m_port="${2-}"
+  m_user="${3-}"
+  m_identity="${4-}"
+  m_timeout=$(clamp_timeout "${5-}")
+
+  valid_host "$m_host" || die "bad-host"
+  valid_user "$m_user" || die "bad-user"
+  valid_port "$m_port" || die "bad-port"
+  valid_identity "$m_identity" || die "bad-identity"
+
+  local -a ssh_opts=()
+  mapfile -t ssh_opts < <(ssh_args interactive)
+  local -a command=(ssh -t "${ssh_opts[@]}" -- "$(machine_target)"
+    '{ curl -fsSL https://herdr.dev/install.sh || wget -qO- https://herdr.dev/install.sh; } | sh; printf "\nPress enter to close "; read _')
+  launch_terminal "$APP_ID.install" "${command[@]}" || die "no-terminal"
+  printf 'ok\n'
+}
+
+require_tools "${1:-}"
+private_dir "$CACHE_DIR" >/dev/null 2>&1 || true
+
+case "${1:-}" in
+  snapshot) cmd_snapshot ;;
+  open) shift; cmd_open "${1-}" "${2-}" "${3-}" ;;
+  probe) shift; cmd_probe "${1-}" "${2-}" "${3-}" "${4-}" "${5-}" "${6-}" ;;
+  install) shift; cmd_install "${1-}" "${2-}" "${3-}" "${4-}" "${5-}" ;;
+  *) die "unknown-command" ;;
+esac

@@ -1,0 +1,32 @@
+#!/bin/bash
+printf 'herdr %s\n' "$*" >>"${STUB_LOG:-/dev/null}"
+
+snapshot() {
+  case "${STUB_HERDR_MODE:-ok}" in
+    weird) echo '{"id":"cli:api:snapshot","result":"busy"}'; return ;;
+  esac
+  cat <<'JSON'
+{"id":"cli:api:snapshot","result":{"snapshot":{"version":"9.9.9","agents":[{"agent":"claude","agent_status":"blocked","pane_id":"w1:p1","state_change_seq":11,"terminal_title":"◐ waiting here","terminal_title_stripped":"waiting here","workspace_id":"w1"},{"agent":"claude","agent_status":"idle","pane_id":"w2:p1","state_change_seq":4,"terminal_title_stripped":"quiet one","workspace_id":"w2"}],"workspaces":[{"workspace_id":"w1","label":"manaw"},{"workspace_id":"w2","label":"ChessLab"}]},"type":"session_snapshot"}}
+JSON
+}
+
+if [ "${STUB_HERDR_MODE:-ok}" = pretty ] && [ "$*" != "--version" ]; then
+  STUB_HERDR_MODE=ok "$0" "$@" | jq .
+  exit "${PIPESTATUS[0]}"
+fi
+
+case "$*" in
+  "--version")
+    echo "herdr 9.9.9" ;;
+  "session list --json")
+    if [ "${STUB_HERDR_MODE:-ok}" = down ]; then exit 1; fi
+    echo '{"sessions":[{"default":true,"name":"default","running":true,"session_dir":"/tmp/d","socket_path":"/tmp/d/herdr.sock"},{"default":false,"name":"old","running":false,"session_dir":"/tmp/o","socket_path":"/tmp/o/herdr.sock"}]}' ;;
+  "api snapshot")
+    snapshot ;;
+  "--session "*" api snapshot")
+    snapshot ;;
+  *"agent focus"*)
+    exit 0 ;;
+  *)
+    exit 2 ;;
+esac
