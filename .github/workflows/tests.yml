@@ -22,7 +22,6 @@ jobs:
       - name: Scripts parse
         run: |
           bash -n bin/herdr-ctl
-          bash -n install.sh
           for f in tests/*.sh tests/stubs/*; do bash -n "$f"; done
 
       - name: Helper script is executable

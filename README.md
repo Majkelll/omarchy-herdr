@@ -46,9 +46,6 @@ omarchy plugin add https://github.com/Majkelll/omarchy-herdr.git --enable
 Click the icon in the bar. This machine's herdr shows up straight away; other
 machines are added from the panel.
 
-From a checkout, `./install.sh` copies the plugin into
-`~/.config/omarchy/plugins/` and asks the shell to rescan.
-
 ### Removing it
 
 ```bash
