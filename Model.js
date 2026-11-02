@@ -21,9 +21,11 @@ var GLYPH = {
   remove: "󰩺",
   refresh: "󰑐",
   open: "󰆍",
-  install: "󰇚",
+  copy: "󰆏",
   alert: "󰀦"
 }
+
+var INSTALL_COMMAND = "curl -fsSL https://herdr.dev/install.sh | sh"
 
 var STATUS_ORDER = { blocked: 0, done: 1, working: 2, idle: 3 }
 
@@ -903,6 +905,7 @@ if (typeof module !== "undefined") {
     LOCAL_ID: LOCAL_ID,
     LOCAL_LABEL: LOCAL_LABEL,
     GLYPH: GLYPH,
+    INSTALL_COMMAND: INSTALL_COMMAND,
     ERRORS: ERRORS,
     clip: clip,
     plain: plain,

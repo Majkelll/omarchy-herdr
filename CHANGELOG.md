@@ -13,8 +13,8 @@
   on its workspace, or a terminal is opened on it, locally or over SSH.
   Clicking an agent focuses its pane first.
 - Machines are added from a form with a Test button that checks ssh, herdr
-  and its version before saving. A machine without herdr gets a button that
-  runs herdr's own installer in a visible terminal.
+  and its version before saving. For a machine without herdr it copies
+  herdr's install command to the clipboard; nothing is downloaded or run.
 - Read-only towards herdr: a refresh never stops a server or deletes a
   session. Background SSH never prompts, every read is capped in bytes and
   every call has a timeout.

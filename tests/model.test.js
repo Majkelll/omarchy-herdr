@@ -646,12 +646,16 @@ describe("the cursor and the blink", () => {
     assert.deepEqual(Model.carryWanting(before, answered), {})
   })
 
-  test("the install button is offered only for a machine without herdr", () => {
+  test("a machine without herdr is told apart, for the copy-the-install-command button", () => {
     const state = Model.parseSnapshot(JSON.stringify({ ok: true, machines: [
       { id: "a", remote: true, enabled: true, reachable: false, error: "herdr-missing" },
       { id: "b", remote: true, enabled: true, reachable: false, error: "auth-failed" }] }))
     const rows = Model.rows(state, {})
     assert.deepEqual(rows.map(r => r.errorCode), ["herdr-missing", "auth-failed"])
+  })
+
+  test("the install command to copy is herdr's own installer, for the user to run", () => {
+    assert.equal(Model.INSTALL_COMMAND, "curl -fsSL https://herdr.dev/install.sh | sh")
   })
 })
 

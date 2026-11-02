@@ -113,6 +113,9 @@ QtObject {
           probeRoot.say("unreachable machine says why=" + (p.rows[machineRow].line !== ""))
           probeRoot.say("no install button for a name that does not resolve="
             + (p.rows[machineRow].errorCode !== "herdr-missing"))
+          p.copyInstallCommand(probeRoot.machineId)
+          probeRoot.say("copying the install command says so and launches nothing="
+            + (p.copiedFor === probeRoot.machineId && p.formOpen === false))
           p.takeCursor(machineRow)
           p.deleteCursor()
           probeRoot.say("first delete only arms=" + (p.removeArmed === probeRoot.machineId && w.machines.length === 1))
@@ -185,6 +188,8 @@ check "a machine that cannot be reached says why" \
   "$(grep -qF 'probe: unreachable machine says why=true' <<<"$out" && echo yes || echo no)"
 check "the install button is only for a missing herdr" \
   "$(grep -qF 'probe: no install button for a name that does not resolve=true' <<<"$out" && echo yes || echo no)"
+check "copying the install command only copies it" \
+  "$(grep -qF 'probe: copying the install command says so and launches nothing=true' <<<"$out" && echo yes || echo no)"
 check "the first delete only arms the button" \
   "$(grep -qF 'probe: first delete only arms=true' <<<"$out" && echo yes || echo no)"
 check "the second delete removes the machine" \

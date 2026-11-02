@@ -236,13 +236,10 @@ check "a probe with a port that is not a port is refused" \
   "bad-port" "$("$CTL" probe h 99999 "" "" 4 2>&1 >/dev/null)"
 
 export HERDR_WIDGET_DRY_RUN=1
-out_install=$("$CTL" install h "" "" "" 4 2>&1)
-check_match "installing runs herdr's own installer in a window you can watch" \
-  'launch: app-id=org.omarchy.herdr.install' "$out_install"
-check_match "and it is the installer from herdr.dev" \
-  'https://herdr.dev/install.sh' "$out_install"
-check "installing a host that is not a host is refused" \
-  "bad-host" "$("$CTL" install 'h;id' "" "" "" 4 2>&1 >/dev/null)"
+check "there is no install command: the widget never runs a downloaded script" \
+  "unknown-command" "$("$CTL" install h "" "" "" 4 2>&1 >/dev/null)"
+check "and the helper fetches nothing from the network" \
+  "no" "$(grep -qE 'curl|wget|https?://' "$CTL" && echo yes || echo no)"
 
 config '[{"id":"a","host":"h"}]'
 check "a config that is a list rather than an object is unreadable" \
@@ -330,8 +327,6 @@ check "a workspace with a space and a quote in its name is still switched to" \
 
 check "a probe with an identity that is not a path is refused" \
   "bad-identity" "$("$CTL" probe h "" "" $'x\n-oProxyCommand=id' 4 2>&1 >/dev/null)"
-check "so is an install" \
-  "bad-identity" "$("$CTL" install h "" "" $'x\n-oProxyCommand=id' 4 2>&1 >/dev/null)"
 check "a herdr path that starts like an option is refused" \
   "bad-path" "$("$CTL" probe h "" "" "" 4 --version 2>&1 >/dev/null)"
 

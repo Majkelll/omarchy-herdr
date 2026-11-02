@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls
+import Quickshell
 import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
@@ -53,6 +54,7 @@ Panel {
   property bool advancedOpen: false
 
   property string removeArmed: ""
+  property string copiedFor: ""
 
   property int selectedIndex: 0
   property bool cursorActive: false
@@ -249,9 +251,10 @@ Panel {
     armTimer.restart()
   }
 
-  function install(id) {
-    if (root.hostWidget) root.hostWidget.install(id)
-    root.close()
+  function copyInstallCommand(id) {
+    Quickshell.clipboardText = Model.INSTALL_COMMAND
+    root.copiedFor = id
+    copiedTimer.restart()
   }
 
   function probeLine() {
@@ -260,7 +263,8 @@ Panel {
     var result = root.probeResult
     if (!result.reachable) return Model.errorText(result.error) || "Could not reach it"
     if (Model.clip(result.error) === "herdr-missing")
-      return "Reached it, but herdr is not installed there"
+      return "Reached it, but herdr is not installed there. Run this over there, then Test again: "
+        + Model.INSTALL_COMMAND
     var text = "Reached it · herdr " + (Model.clip(result.version) || "?")
     text += result.server ? " · a server is running" : " · no server running yet"
     return text
@@ -337,6 +341,13 @@ Panel {
     interval: 4000
     repeat: false
     onTriggered: root.removeArmed = ""
+  }
+
+  Timer {
+    id: copiedTimer
+    interval: 4000
+    repeat: false
+    onTriggered: root.copiedFor = ""
   }
 
   component ListRow: CursorSurface {
@@ -709,13 +720,15 @@ Panel {
                     PanelActionButton {
                       visible: modelData.kind === "machine" && modelData.remote === true
                         && modelData.errorCode === "herdr-missing" && modelData.enabled === true
-                      iconText: Model.GLYPH.install
-                      tooltipText: "Install herdr over there"
+                      iconText: Model.GLYPH.copy
+                      tooltipText: root.copiedFor === modelData.machine
+                        ? "Copied. Run it on that machine to install herdr"
+                        : "Copy herdr's install command: " + Model.INSTALL_COMMAND
                       foreground: root.foreground
                       hoverColor: Commons.Color.accent
                       fontFamily: root.fontFamily
                       fontSize: Style.font.iconSmall
-                      onClicked: root.install(modelData.machine)
+                      onClicked: root.copyInstallCommand(modelData.machine)
                     }
 
                     PanelActionButton {
@@ -958,6 +971,19 @@ Panel {
             Item {
               width: parent.width
               implicitHeight: saveButton.implicitHeight
+
+              Button {
+                visible: root.probeNeedsInstall()
+                text: root.copiedFor === "form" ? "Copied" : "Copy"
+                iconText: Model.GLYPH.copy
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                height: saveButton.height
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                onClicked: root.copyInstallCommand("form")
+              }
 
               Button {
                 text: root.probing ? "Testing…" : "Test"

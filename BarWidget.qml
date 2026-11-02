@@ -297,15 +297,6 @@ BarWidget {
     Qt.callLater(root.fillNextHerdrPath)
   }
 
-  function install(id) {
-    var machine = Model.findMachine(root.machines, id)
-    if (!machine) return
-    root.actionError = ""
-    Quickshell.execDetached([root.ctlPath, "install", machine.host,
-      machine.port > 0 ? String(machine.port) : "", machine.user,
-      machine.identityFile, String(machine.connectTimeoutSec)])
-  }
-
   function refresh() {
     var lead = root.leader()
     if (lead !== root) { lead.refresh(); return }

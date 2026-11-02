@@ -32,7 +32,7 @@ ship.
 - **Adding a machine is a form, with a Test button.** It says whether ssh gets
   there, whether herdr is installed, which version, and whether a server is
   already running, before anything is saved. If herdr is missing over there,
-  one button runs herdr's own installer in a terminal you can watch.
+  it shows herdr's install command and copies it for you to run there.
 - **Keyboard everything.** The panel never needs the mouse.
 
 ![The Herdr panel: three machines, their sessions, and agents in herdr's colours](preview.png)
@@ -165,9 +165,10 @@ than one monitor, only one copy of the widget polls.
 - **Every read is bounded.** Output from herdr, ssh, hyprctl and ps is capped
   in bytes before it is parsed, and every call has a timeout, so a misbehaving
   server cannot freeze the bar or grow the shell process.
-- **The one network action is yours.** The install button runs herdr's own
-  installer (`https://herdr.dev/install.sh`) on the remote machine, in a
-  terminal you can see, and only when you press it.
+- **Nothing is downloaded or installed.** For a machine without herdr the
+  panel only copies herdr's install command
+  (`curl -fsSL https://herdr.dev/install.sh | sh`) to the clipboard. Running
+  it is up to you.
 - **Written to disk:** `~/.config/omarchy-herdr/machines.json` (your machine
   list) and SSH control sockets in `~/.cache/omarchy-herdr/`. Nothing else.
 
@@ -188,11 +189,10 @@ tests/              Node tests for Model.js, stubbed tests for herdr-ctl, a QML 
 bin/herdr-ctl snapshot                      # the whole herd, as JSON
 bin/herdr-ctl open <machine> <session> [pane]
 bin/herdr-ctl probe <host> <port> <user> <identity> <timeout> [herdr-path]
-bin/herdr-ctl install <host> <port> <user> <identity> <timeout>
 ```
 
-Set `HERDR_WIDGET_DRY_RUN=1` and `open` and `install` print what they would
-run instead of running it.
+Set `HERDR_WIDGET_DRY_RUN=1` and `open` prints what it would run instead of
+running it.
 
 ## Tests
 

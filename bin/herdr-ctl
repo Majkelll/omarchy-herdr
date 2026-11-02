@@ -847,26 +847,6 @@ probe_result() {
     {reachable: $reachable, herdrPath: $path, version: $version, server: $server, error: $error}'
 }
 
-cmd_install() {
-  m_host="${1-}"
-  m_port="${2-}"
-  m_user="${3-}"
-  m_identity="${4-}"
-  m_timeout=$(clamp_timeout "${5-}")
-
-  valid_host "$m_host" || die "bad-host"
-  valid_user "$m_user" || die "bad-user"
-  valid_port "$m_port" || die "bad-port"
-  valid_identity "$m_identity" || die "bad-identity"
-
-  local -a ssh_opts=()
-  mapfile -t ssh_opts < <(ssh_args interactive)
-  local -a command=(ssh -t "${ssh_opts[@]}" -- "$(machine_target)"
-    '{ curl -fsSL https://herdr.dev/install.sh || wget -qO- https://herdr.dev/install.sh; } | sh; printf "\nPress enter to close "; read _')
-  launch_terminal "$APP_ID.install" "${command[@]}" || die "no-terminal"
-  printf 'ok\n'
-}
-
 require_tools "${1:-}"
 private_dir "$CACHE_DIR" >/dev/null 2>&1 || true
 
@@ -874,6 +854,5 @@ case "${1:-}" in
   snapshot) cmd_snapshot ;;
   open) shift; cmd_open "${1-}" "${2-}" "${3-}" ;;
   probe) shift; cmd_probe "${1-}" "${2-}" "${3-}" "${4-}" "${5-}" "${6-}" ;;
-  install) shift; cmd_install "${1-}" "${2-}" "${3-}" "${4-}" "${5-}" ;;
   *) die "unknown-command" ;;
 esac
