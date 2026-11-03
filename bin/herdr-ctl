@@ -20,6 +20,7 @@ readonly SNAPSHOT_BYTE_CAP=$((2 * 1024 * 1024))
 readonly SNAPSHOTS_BYTE_CAP=8000000
 readonly WINDOWS_BYTE_CAP=$((4 * 1024 * 1024))
 readonly PS_BYTE_CAP=$((4 * 1024 * 1024))
+readonly ERR_BYTE_CAP=8192
 readonly MACHINE_CAP=32
 readonly SESSION_CAP=64
 readonly AGENT_CAP=200
@@ -169,7 +170,7 @@ ssh_error_code() {
   local status="$1" text="$2"
   case "$status" in
     124|137) printf 'timeout'; return ;;
-    99) printf 'too-large'; return ;;
+    99|153) printf 'too-large'; return ;;
   esac
   case "$text" in
     *"bash: command not found"*|*"bash: not found"*|*"bash: No such file"*)
@@ -195,14 +196,24 @@ remote_run() {
   fi
   local quoted=""
   (( $# == 0 )) || printf -v quoted ' %q' "$@"
-  local out status
-  out=$(timeout -k 2 "$budget" ssh "${args[@]}" -- "$(machine_target)" \
-    "bash -s --$quoted" <<<"$script" 2>"$err_file")
+  local out_file status size
+  out_file=$(mktemp -p "${TMPDIR:-/tmp}" herdr-ctl-out.XXXXXX) || return 1
+  (
+    ulimit -f "$(( (cap > ERR_BYTE_CAP ? cap : ERR_BYTE_CAP) / 1024 + 2 ))"
+    exec timeout -k 2 "$budget" ssh "${args[@]}" -- "$(machine_target)" \
+      "bash -s --$quoted" <<<"$script" >"$out_file" 2>"$err_file"
+  )
   status=$?
-  if (( status != 0 )); then return "$status"; fi
-  if over_cap "$out" "$cap"; then return 99; fi
-  printf '%s' "$out"
+  size=$(wc -c <"$out_file" 2>/dev/null) || size=0
+  if (( size > cap )); then rm -f -- "$out_file"; return 99; fi
+  if (( status != 0 )); then rm -f -- "$out_file"; return "$status"; fi
+  cat -- "$out_file"
+  rm -f -- "$out_file"
   return 0
+}
+
+remote_errors() {
+  head -c "$ERR_BYTE_CAP" -- "$err_file" 2>/dev/null
 }
 
 readonly REMOTE_INVENTORY='
@@ -382,7 +393,7 @@ gather_remote() {
     status=$?
     (( status == 3 )) && { remote_failure herdr-missing; return 0; }
     (( status == 0 )) || {
-      remote_failure "$(ssh_error_code "$status" "$(cat -- "$err_file" 2>/dev/null)")"
+      remote_failure "$(ssh_error_code "$status" "$(remote_errors)")"
       return 0
     }
     path="$m_herdr"
@@ -393,7 +404,7 @@ gather_remote() {
   status=$?
   (( status == 99 )) && { remote_failure too-large; return 0; }
   if (( status != 0 )) || [[ -z $out ]]; then
-    remote_failure "$(ssh_error_code "$status" "$(cat -- "$err_file" 2>/dev/null)")"
+    remote_failure "$(ssh_error_code "$status" "$(remote_errors)")"
     return 0
   fi
   version=$(strip_version "$(printf '%s' "$out" | sed -n 's/^V//p' | head -1)")
@@ -404,7 +415,7 @@ gather_remote() {
     status=$?
     (( status == 3 )) && { remote_failure herdr-missing; return 0; }
     (( status == 0 )) || {
-      remote_failure "$(ssh_error_code "$status" "$(cat -- "$err_file" 2>/dev/null)")"
+      remote_failure "$(ssh_error_code "$status" "$(remote_errors)")"
       return 0
     }
     path="$m_herdr"
@@ -412,7 +423,7 @@ gather_remote() {
     status=$?
     (( status == 99 )) && { remote_failure too-large; return 0; }
     if (( status != 0 )) || [[ -z $out ]]; then
-      remote_failure "$(ssh_error_code "$status" "$(cat -- "$err_file" 2>/dev/null)")"
+      remote_failure "$(ssh_error_code "$status" "$(remote_errors)")"
       return 0
     fi
     version=$(strip_version "$(printf '%s' "$out" | sed -n 's/^V//p' | head -1)")
@@ -438,7 +449,7 @@ gather_remote() {
     out=$(remote_run "$REMOTE_INVENTORY" "$SNAPSHOTS_BYTE_CAP" "$path" "${names[@]}")
     status=$?
     if (( status != 0 )); then
-      remote_failure "$(ssh_error_code "$status" "$(cat -- "$err_file" 2>/dev/null)")" "$version"
+      remote_failure "$(ssh_error_code "$status" "$(remote_errors)")" "$version"
       return 0
     fi
     local line snap_name snap_json default_name
@@ -815,7 +826,7 @@ cmd_probe() {
   out=$(remote_run "$REMOTE_LOCATE" 4096 "$m_herdr")
   status=$?
   if (( status != 0 )); then
-    probe_result false "" "" false "$(ssh_error_code "$status" "$(cat -- "$err_file" 2>/dev/null)")"
+    probe_result false "" "" false "$(ssh_error_code "$status" "$(remote_errors)")"
     return 0
   fi
   path=$(printf '%s' "$out" | sed -n 's/^P//p' | head -1)
@@ -827,7 +838,7 @@ cmd_probe() {
   out=$(remote_run "$REMOTE_INVENTORY" "$SESSIONS_BYTE_CAP" "$path")
   status=$?
   if (( status != 0 )); then
-    probe_result true "$path" "" false "$(ssh_error_code "$status" "$(cat -- "$err_file" 2>/dev/null)")"
+    probe_result true "$path" "" false "$(ssh_error_code "$status" "$(remote_errors)")"
     return 0
   fi
 

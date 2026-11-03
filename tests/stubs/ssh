@@ -10,6 +10,9 @@ case "${STUB_SSH_MODE:-ok}" in
     exec bash -c "$remote_args" <<<"$script" ;;
   hang)
     exec sleep 30 ;;
+  flood)    exec yes "Vflood" ;;
+  errflood) exec yes "noise" >&2 ;;
+  trickle)  while :; do printf 'x'; sleep 0.2; done ;;
   nobash)   printf 'bash: command not found\n' >&2; exit 127 ;;
   auth)     printf 'Permission denied (publickey).\n' >&2; exit 255 ;;
   hostkey)  printf 'Host key verification failed.\n' >&2; exit 255 ;;

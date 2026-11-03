@@ -163,8 +163,10 @@ than one monitor, only one copy of the widget polls.
   script piped over stdin; every argument it gets is a validated session name,
   pane id or path, quoted before it is sent.
 - **Every read is bounded.** Output from herdr, ssh, hyprctl and ps is capped
-  in bytes before it is parsed, and every call has a timeout, so a misbehaving
-  server cannot freeze the bar or grow the shell process.
+  in bytes as it arrives, before it is stored or parsed, and every call has a
+  timeout. An SSH session whose stdout or stderr goes over its limit is
+  stopped on the spot, so a misbehaving or compromised server cannot freeze
+  the bar, fill the disk or grow the shell process.
 - **Nothing is downloaded or installed.** For a machine without herdr the
   panel only copies herdr's install command
   (`curl -fsSL https://herdr.dev/install.sh | sh`) to the clipboard. Running

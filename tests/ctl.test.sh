@@ -316,6 +316,36 @@ check "a host that never answers reads as timeout" \
 check "and costs at most three of its connect timeouts" \
   "yes" "$( (( SECONDS - started <= 9 )) && echo yes || echo no)"
 
+mkdir -p "$WORK/tmp"
+started=$SECONDS
+out_flood=$(TMPDIR="$WORK/tmp" STUB_SSH_MODE=flood snapshot)
+check "a host that floods stdout is cut off as it writes, not after" \
+  "too-large" "$(jq -r '.machines[1].error' <<<"$out_flood")"
+check "and is stopped at once rather than at its timeout" \
+  "yes" "$( (( SECONDS - started <= 2 )) && echo yes || echo no)"
+started=$SECONDS
+out_flood=$(TMPDIR="$WORK/tmp" STUB_SSH_MODE=errflood snapshot)
+check "a host that floods stderr is cut off too" \
+  "too-large" "$(jq -r '.machines[1].error' <<<"$out_flood")"
+check "and is stopped at once as well" \
+  "yes" "$( (( SECONDS - started <= 2 )) && echo yes || echo no)"
+started=$SECONDS
+out_flood=$(TMPDIR="$WORK/tmp" STUB_SSH_MODE=trickle snapshot)
+check "a host that streams until its timeout reads as timeout" \
+  "timeout" "$(jq -r '.machines[1].error' <<<"$out_flood")"
+check "within its timeout budget" \
+  "yes" "$( (( SECONDS - started <= 9 )) && echo yes || echo no)"
+out_probe=$(TMPDIR="$WORK/tmp" STUB_SSH_MODE=flood "$CTL" probe h "" "" "" 2 2>/dev/null)
+check "a probe of a flooding host is cut off too" \
+  "false too-large" "$(jq -r '"\(.reachable) \(.error)"' <<<"$out_probe")"
+out_probe=$(TMPDIR="$WORK/tmp" STUB_SSH_MODE=errflood "$CTL" probe h "" "" "" 2 2>/dev/null)
+check "so is one that floods stderr" \
+  "false too-large" "$(jq -r '"\(.reachable) \(.error)"' <<<"$out_probe")"
+check "and nothing is left behind in the temp directory" \
+  "" "$(ls -A "$WORK/tmp")"
+check "no flooding process outlives the helper" \
+  "" "$(pgrep -f '^yes (Vflood|noise)$' || true)"
+
 config '{"version":1,"machines":[]}'
 check "a program with herdr only in its arguments is not a herdr window" \
   "" "$(STUB_PS_MODE=noisy snapshot | jq -r '.machines[0].sessions[] | select(.name == "default") | .window')"
